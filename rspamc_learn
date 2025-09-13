@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+import os
+import subprocess
+import sqlite3
+import time
+import email
+import email.policy
+import random
+
+VERSION = "v0.2-20250901.3"
+MAILROOT = "/vhome/vmail"
+TIMESTAMP_FILE = "/var/lib/rspamd/learn_timestamp"
+RSPAMD_LOG = "/var/log/rspamd/rspamd.log"
+FACTOR = int(os.environ.get("FACTOR", 6))
+DEBUG = int(os.environ.get("DEBUG", 0))
+TEST = False
+
+ALIASES = {
+    "chris@ckvsoft.at": ["info@ckvsoft.at", "press@ckvsoft.at", "root@ckvsoft.at", "office@kvasny.at"],
+    "office@schmidlmoto.at": [],
+    "richard@hrozek.at": [],
+    "denise@kvasny.at": [],
+}
+
+EXCLUDE_DIRS = {'sieve', 'pgp'}
+
+spam_count = {}
+ham_count = {}
+timestamp_updated = False
+
+def debug(msg):
+    if DEBUG:
+        print(msg)
+
+def is_excluded(name):
+    return name.startswith('.') or name in EXCLUDE_DIRS
+
+def get_learned_counts(user):
+    dbs = {
+        "spam": "/var/lib/rspamd/bayes.users.spam.sqlite",
+        "ham":  "/var/lib/rspamd/bayes.users.ham.sqlite"
+    }
+    counts = {}
+
+    for key, path in dbs.items():
+        counts[key] = 0
+        if not os.path.isfile(path):
+            print(f"Warnung: Datei existiert nicht: {path}")
+            continue
+        try:
+            with sqlite3.connect(path) as con:
+                row = con.execute("SELECT learns FROM users WHERE name=?", (user,)).fetchone()
+                counts[key] = row[0] if row else 0
+        except Exception as e:
+            print(f"Fehler beim Lesen von {path}: {e}")
+
+    return counts["spam"], counts["ham"]
+
+def load_last_ts(user):
+    ts_file = f"{TIMESTAMP_FILE}.{user.replace('@', '_')}"
+    if os.path.exists(ts_file):
+        with open(ts_file) as f:
+            try:
+                return int(f.read().strip())
+            except ValueError:
+                return 0
+    return 0
+
+def save_last_ts(user):
+    ts_file = f"{TIMESTAMP_FILE}.{user.replace('@', '_')}"
+    try:
+        os.makedirs(os.path.dirname(ts_file), exist_ok=True)
+    except FileExistsError:
+        pass
+    ts = int(time.time())
+    with open(ts_file, "w") as f:
+        f.write(str(ts))
+    debug(f"Timestamp gespeichert für {user}: {ts}")
+
+
+def learn_mail(mail_type, user, filepath):
+    cmd = ["rspamc", "--classifier=users", f"learn_{mail_type}", "-d", user, filepath]
+    output = subprocess.run(cmd, capture_output=True, text=True)
+    if 'success = true' in output.stdout:
+        if mail_type == "spam":
+            spam_count[user] = spam_count.get(user, 0) + 1
+        else:
+            ham_count[user] = ham_count.get(user, 0) + 1
+        debug(f"✅ {mail_type} gelernt für {user}: {filepath}")
+        return True
+    else:
+        debug(f"⚠️ {mail_type} nicht gelernt für {user}: {filepath} ({output.stdout.strip()})")
+        return False
+
+def extract_recipients(filepath):
+    recipients = set()
+    try:
+        with open(filepath, 'rb') as f:
+            msg = email.message_from_binary_file(f, policy=email.policy.default)
+            for hdr in ['to', 'cc']:
+                if hdr in msg:
+                    addrs = email.utils.getaddresses(msg.get_all(hdr, []))
+                    for _, addr in addrs:
+                        addr = addr.strip('<> ')
+                        if addr:
+                            recipients.add(addr)
+    except Exception as e:
+        debug(f"Fehler beim Lesen von {filepath}: {e}")
+    return recipients
+
+def mail_newer_than(mail_path, last_ts):
+    try:
+        mtime = int(os.path.getmtime(mail_path))
+        return mtime > last_ts
+    except Exception:
+        return True  # falls Fehler, Mail trotzdem verarbeiten
+
+def collect_ham_mails(user_path, last_ts_per_user):
+    mails = []
+
+    # Prüfen, ob direkt im root ein "cur"-Ordner existiert
+    cur_path = os.path.join(user_path, "cur")
+    if os.path.isdir(cur_path):
+        for f in os.listdir(cur_path):
+            mail_path = os.path.join(cur_path, f)
+            if os.path.isfile(mail_path) and any(os.path.getmtime(mail_path) > last_ts_per_user[user] for user in last_ts_per_user):
+                mails.append(mail_path)
+
+    # rekursiv durch Unterordner laufen
+    for root, dirs, files in os.walk(user_path):
+        dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS and d not in (".Junk-E-Mail", ".Trash")]
+        if os.path.basename(root) == "cur" and root != cur_path:  # schon obiges cur ausgeschlossen
+            for f in files:
+                mail_path = os.path.join(root, f)
+                if any(os.path.getmtime(mail_path) > last_ts_per_user[user] for user in last_ts_per_user):
+                    mails.append(mail_path)
+
+    random.shuffle(mails)
+    return mails
+
+def process_user(full_user, user_path):
+    global timestamp_updated
+    print("="*70)
+    print(f"Bearbeite Postfach: {full_user}")
+
+    valid_users = {full_user} | set(ALIASES.get(full_user, []))
+
+    # Spam
+    spam_dir = os.path.join(user_path, ".Junk-E-Mail", "cur")
+    spam_mails = []
+    if os.path.exists(spam_dir):
+        spam_mails = [os.path.join(spam_dir, f) for f in os.listdir(spam_dir) if os.path.isfile(os.path.join(spam_dir, f))]
+    print(f"Spam: {len(spam_mails)} Mails")
+
+    learned_spam_per_user = {user: 0 for user in valid_users}
+    for mail in spam_mails:
+        recipients = extract_recipients(mail)
+        # nur die Empfänger, die auch valid_users sind
+        targets = set(recipients) & valid_users
+        for user in targets:
+            if TEST or learn_mail("spam", user, mail):
+                learned_spam_per_user[user] += 1
+
+    print("Spam: gelernt: " + ", ".join(
+        f"{user}: {count}"
+        for user, count in learned_spam_per_user.items()
+    ))
+
+    # Ham
+    last_ts_per_user = {user: load_last_ts(user) for user in valid_users}
+    ham_mails = collect_ham_mails(user_path, last_ts_per_user)
+    print(f"Ham: {len(ham_mails)} Mails")
+
+    # Ham-Limits nach Spam-Lernen für jeden valid user
+    max_ham_per_user = {}
+    for user in valid_users:
+        spam_learned, ham_learned = get_learned_counts(user)
+        max_ham_per_user[user] = max(spam_learned * FACTOR - ham_learned, 0)
+    debug(f"Ham-Limits: {max_ham_per_user}")
+
+    # Ham lernen
+    learned_per_user = {user: 0 for user in valid_users}
+    for mail in ham_mails:
+        # Wenn alle User ihr Limit erreicht haben, Schleife verlassen
+        if all(learned_per_user[user] >= max_ham_per_user[user] for user in valid_users):
+            debug(f"Break: max_ham_per_user wurde erreicht")
+            break
+
+        recipients = extract_recipients(mail)
+        targets = set(recipients) & valid_users
+        for user in targets:
+            if learned_per_user[user] < max_ham_per_user[user]:
+                if TEST or learn_mail("ham", user, mail):
+                    learned_per_user[user] += 1
+                    save_last_ts(user)
+                    timestamp_updated = True
+    print("Ham: gelernt: " + ", ".join(
+        f"{user}: {count}/{max_ham_per_user[user]}"
+        for user, count in learned_per_user.items()
+    ))
+
+def print_sql_stats():
+    print("="*70)
+
+    spam_db = "/var/lib/rspamd/bayes.users.spam.sqlite"
+    ham_db  = "/var/lib/rspamd/bayes.users.ham.sqlite"
+
+    # SPAM
+    print("SPAM learned per user (echte Daten)")
+    print("-"*70)
+    if not os.path.isfile(spam_db):
+        print(f"Warnung: Datei existiert nicht: {spam_db}")
+    else:
+        try:
+            con = sqlite3.connect(spam_db)
+            for row in con.execute("SELECT * FROM users"):
+                print(row)
+            con.close()
+        except Exception as e:
+            print(f"Fehler beim Lesen von {spam_db}: {e}")
+
+    print("-"*70)
+
+    # HAM
+    print("HAM learned per user (echte Daten)")
+    print("-"*70)
+    if not os.path.isfile(ham_db):
+        print(f"Warnung: Datei existiert nicht: {ham_db}")
+    else:
+        try:
+            con = sqlite3.connect(ham_db)
+            for row in con.execute("SELECT * FROM users"):
+                print(row)
+            con.close()
+        except Exception as e:
+            print(f"Fehler beim Lesen von {ham_db}: {e}")
+
+def greylist_stats():
+    print("="*70)
+
+    if not os.path.isfile(RSPAMD_LOG):
+        print(f"Warnung: Logdatei existiert nicht: {RSPAMD_LOG}")
+        new_count = accepted_count = 0
+    else:
+        new_count = 0
+        accepted_count = 0
+        try:
+            with open(RSPAMD_LOG, "r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    if "GREYLIST" not in line:
+                        continue
+                    if "new record" in line:
+                        new_count += 1
+                    elif "pass" in line:
+                        accepted_count += 1
+        except Exception as e:
+            print(f"Fehler beim Lesen der Datei {RSPAMD_LOG}: {e}")
+            new_count = accepted_count = 0
+
+    not_returned = max(new_count - accepted_count, 0)
+
+    print("Greylist Statistik")
+    print("-"*70)
+    print(f"Neu Greylisted:        {new_count}")
+    print(f"Davon akzeptiert:      {accepted_count}")
+    print(f"Nie wiedergekommen:    {not_returned}")
+
+def main():
+    print(f"rspamc learn {VERSION}")
+    if not os.path.isdir(MAILROOT):
+        print(f"⚠ MAILROOT {MAILROOT} existiert nicht – Debug-Modus aktiv")
+        return
+
+    for domain in os.listdir(MAILROOT):
+        domain_path = os.path.join(MAILROOT, domain)
+        if not os.path.isdir(domain_path) or is_excluded(domain):
+            continue
+        for user in os.listdir(domain_path):
+            user_path = os.path.join(domain_path, user)
+            if not os.path.isdir(user_path):
+                continue
+            full_user = f"{user}@{domain}"
+            process_user(full_user, user_path)
+
+    # Zusammenfassung
+    debug("="*70)
+    debug("GESAMT gelernt")
+    debug("-"*70)
+    total_spam = sum(spam_count.values())
+    total_ham = sum(ham_count.values())
+    debug(f"SPAM: {total_spam}")
+    debug(f"HAM:  {total_ham}")
+    debug("="*70)
+
+    print_sql_stats()
+    greylist_stats()
+    print("="*70)
+
+if __name__ == "__main__":
+    main()
