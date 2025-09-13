@@ -18,8 +18,6 @@ TEST = False
 ALIASES = {
     "chris@ckvsoft.at": ["info@ckvsoft.at", "press@ckvsoft.at", "root@ckvsoft.at", "office@kvasny.at"],
     "office@schmidlmoto.at": [],
-    "richard@hrozek.at": [],
-    "denise@kvasny.at": [],
 }
 
 EXCLUDE_DIRS = {'sieve', 'pgp'}
